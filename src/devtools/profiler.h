@@ -9,8 +9,10 @@
 
 #define PROFILER_ENTRIES 64
 #define PROFILER_HISTORY 256
+#define CALLSTACK_MAX_DEPTH 1000
 
 class Profiler {
+public:
     enum ProfileEventType {
         CALL,
         RETURN
@@ -39,8 +41,8 @@ public:
 
 private:
     Timekeeper& timekeeper;
-    bool deepProfileIsRecording;
-    uint64_t deepProfileStartCycleCount;
+    bool deepProfileIsRecording = false;
+    uint64_t deepProfileStartCycleCount = 0;
 
     std::string profileEventTypeToString(ProfileEventType type);
     void recursiveNodePrintToFile(std::ofstream& file, DeepProfileCallNode* node, uint16_t depth);
@@ -62,12 +64,13 @@ public:
     int fps = 60;
     int history_num = 0;
     bool measure_by_frameflip = false;
+    bool callstack_tracking_enabled = true;
     std::vector<ProfileEvent> timeline;
     void LogJSR(uint16_t address, uint8_t bank, uint16_t dest);
     void LogRTS(uint16_t address, uint8_t bank);
     void DeepProfileStart();
     void DeepProfileStop(MemoryMap* memory_map, SourceMap* source_map);
-    DeepProfileCallNode* lastDeepProfileRoot;
-    DeepProfileCallNode* deepProfileZoomFocus;
+    DeepProfileCallNode* lastDeepProfileRoot = nullptr;
+    DeepProfileCallNode* deepProfileZoomFocus = nullptr;
     std::vector<DeepProfileCallNode*> cleanupList;
 };

@@ -2,10 +2,37 @@
 #include "profiler_window.h"
 #include "implot.h"
 #include "../audio_coprocessor.h"
+#include "../tinyfd/tinyfiledialogs.h"
+#include <fstream>
 
 static float prof_R[8] = {1,    1, 1, 0, 0, 0.5f, 0.5f, 1};
 static float prof_G[8] = {0, 0.5f, 1, 1, 0,    0, 0.5f, 1};
 static float prof_B[8] = {0,    0, 0, 0, 1, 0.5f, 0.5f, 1};
+
+void ProfilerWindow::aggregate_function_stats(Profiler::DeepProfileCallNode* node, std::map<std::string, FunctionStats>& stats) {
+    if (node == nullptr) return;
+    
+    if (!node->name.empty() && node->name != "root") {
+        auto& entry = stats[node->name];
+        if (entry.name.empty()) {
+            entry.name = node->name;
+            entry.totalCycles = 0;
+            entry.callCount = 0;
+            entry.minCycles = UINT32_MAX;
+            entry.maxCycles = 0;
+        }
+        entry.totalCycles += node->duration;
+        entry.callCount++;
+        if (node->duration < entry.minCycles) entry.minCycles = node->duration;
+        if (node->duration > entry.maxCycles) entry.maxCycles = node->duration;
+    }
+    
+    for (auto& child : node->children) {
+        if (child != nullptr) {
+            aggregate_function_stats(child, stats);
+        }
+    }
+}
 
 void ProfilerWindow::recurse_tree_nodes(Profiler::DeepProfileCallNode* node, uint64_t totalCycles, uint64_t startTime) {
     ImGui::PushID(node);
@@ -87,7 +114,7 @@ ImVec2 ProfilerWindow::Render() {
                 ImGui::Checkbox("##", &profilerVis[i]);
                 ImGui::SameLine();
                 ImGui::TextColored(ImVec4(prof_R[i % 8], prof_G[i % 8], prof_B[i % 8], 1.0f), 
-                "Timer %02d: %ld / %ld", i, _profiler.profilingLastSample[i], _profiler.profilingLastSampleCount[i]);
+                "Timer %02d: %u / %u", i, _profiler.profilingLastSample[i], _profiler.profilingLastSampleCount[i]);
                 ImGui::PopID();
             }
         }
@@ -98,24 +125,132 @@ ImVec2 ProfilerWindow::Render() {
     if(ImGui::BeginTabItem("Deep Profile")) {
         if(_profiler.lastDeepProfileRoot == nullptr) {
             ImGui::Text("Run a deep profile to see results here");
+            // Clear cache when no profile exists
+            if (_lastCachedRoot != nullptr) {
+                _lastCachedRoot = nullptr;
+                _cachedStats.clear();
+            }
         } else {
-
-            if(_profiler.deepProfileZoomFocus == nullptr) {
-                ImGui::Text("Total: %d cycles", _profiler.lastDeepProfileRoot->duration);
-                for(auto& node : _profiler.lastDeepProfileRoot->children) {
-                    recurse_tree_nodes(node, _profiler.lastDeepProfileRoot->duration, 0);
+            // Rebuild cached stats if the profile root changed
+            if (_lastCachedRoot != _profiler.lastDeepProfileRoot) {
+                _lastCachedRoot = _profiler.lastDeepProfileRoot;
+                std::map<std::string, FunctionStats> statsMap;
+                aggregate_function_stats(_profiler.lastDeepProfileRoot, statsMap);
+                _cachedStats.clear();
+                for (auto& pair : statsMap) {
+                    _cachedStats.push_back(pair.second);
                 }
-            } else {
-                ImGui::Text("%s: %d cycles", _profiler.deepProfileZoomFocus->name.c_str(), _profiler.deepProfileZoomFocus->duration);
-                ImGui::SameLine();
-                if(ImGui::Button("<##unzoom")) {
-                    _profiler.deepProfileZoomFocus = nullptr;
+                // Sort by total cycles descending
+                std::sort(_cachedStats.begin(), _cachedStats.end(), 
+                    [](const FunctionStats& a, const FunctionStats& b) {
+                        return a.totalCycles > b.totalCycles;
+                    });
+            }
+
+            ImGui::BeginTabBar("deepprofiletabs", 0);
+            
+            // Tree View Tab
+            if(ImGui::BeginTabItem("Call Tree")) {
+                if(_profiler.deepProfileZoomFocus == nullptr) {
+                    ImGui::Text("Total: %d cycles", _profiler.lastDeepProfileRoot->duration);
+                    for(auto& node : _profiler.lastDeepProfileRoot->children) {
+                        recurse_tree_nodes(node, _profiler.lastDeepProfileRoot->duration, 0);
+                    }
                 } else {
-                    for(auto& node : _profiler.deepProfileZoomFocus->children) {
-                        recurse_tree_nodes(node, _profiler.deepProfileZoomFocus->duration, _profiler.deepProfileZoomFocus->offset);
+                    ImGui::Text("%s: %d cycles", _profiler.deepProfileZoomFocus->name.c_str(), _profiler.deepProfileZoomFocus->duration);
+                    ImGui::SameLine();
+                    if(ImGui::Button("<##unzoom")) {
+                        _profiler.deepProfileZoomFocus = nullptr;
+                    } else {
+                        for(auto& node : _profiler.deepProfileZoomFocus->children) {
+                            recurse_tree_nodes(node, _profiler.deepProfileZoomFocus->duration, _profiler.deepProfileZoomFocus->offset);
+                        }
                     }
                 }
+                ImGui::EndTabItem();
             }
+            
+            // Hotspots Tab (sorted by total time)
+            if(ImGui::BeginTabItem("Hotspots")) {
+                ImGui::Text("Functions sorted by total time (most expensive first)");
+                ImGui::Text("Total frame: %d cycles", _profiler.lastDeepProfileRoot->duration);
+                
+                // Export to CSV button
+                if (ImGui::Button("Export to CSV")) {
+                    const char* filterPatterns[1] = {"*.csv"};
+                    const char* savePath = tinyfd_saveFileDialog(
+                        "Export Hotspots to CSV",
+                        "hotspots.csv",
+                        1,
+                        filterPatterns,
+                        "CSV Files"
+                    );
+                    
+                    if (savePath != nullptr) {
+                        std::ofstream csvFile(savePath);
+                        if (csvFile.is_open()) {
+                            uint64_t totalCycles = _profiler.lastDeepProfileRoot->duration;
+                            csvFile << "Function,Total Cycles,Percentage,Call Count,Average,Min,Max\n";
+                            for (const auto& stat : _cachedStats) {
+                                float pct = (100.0f * (float)stat.totalCycles) / (float)totalCycles;
+                                uint64_t avg = stat.callCount > 0 ? stat.totalCycles / stat.callCount : 0;
+                                
+                                csvFile << stat.name << ","
+                                       << stat.totalCycles << ","
+                                       << pct << ","
+                                       << stat.callCount << ","
+                                       << avg << ","
+                                       << stat.minCycles << ","
+                                       << stat.maxCycles << "\n";
+                            }
+                            
+                            csvFile.close();
+                        }
+                    }
+                }
+                
+                ImGui::Separator();
+                
+                if (ImGui::BeginTable("HotspotsTable", 6, 
+                    ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | 
+                    ImGuiTableFlags_Sortable | ImGuiTableFlags_Resizable,
+                    ImVec2(0, 600))) {
+                    
+                    ImGui::TableSetupScrollFreeze(0, 1);
+                    ImGui::TableSetupColumn("Function", ImGuiTableColumnFlags_WidthStretch);
+                    ImGui::TableSetupColumn("Total", ImGuiTableColumnFlags_WidthFixed, 80.0f);
+                    ImGui::TableSetupColumn("%", ImGuiTableColumnFlags_WidthFixed, 50.0f);
+                    ImGui::TableSetupColumn("Calls", ImGuiTableColumnFlags_WidthFixed, 50.0f);
+                    ImGui::TableSetupColumn("Avg", ImGuiTableColumnFlags_WidthFixed, 60.0f);
+                    ImGui::TableSetupColumn("Min/Max", ImGuiTableColumnFlags_WidthFixed, 100.0f);
+                    ImGui::TableHeadersRow();
+                    
+                    uint64_t totalCycles = _profiler.lastDeepProfileRoot->duration;
+                    
+                    for (const auto& stat : _cachedStats) {
+                        ImGui::TableNextRow();
+                        ImGui::TableNextColumn();
+                        ImGui::Text("%s", stat.name.c_str());
+                        ImGui::TableNextColumn();
+                        ImGui::Text("%llu", (unsigned long long)stat.totalCycles);
+                        ImGui::TableNextColumn();
+                        float pct = (100.0f * (float)stat.totalCycles) / (float)totalCycles;
+                        ImGui::Text("%.1f%%", pct);
+                        ImGui::TableNextColumn();
+                        ImGui::Text("%u", stat.callCount);
+                        ImGui::TableNextColumn();
+                        uint64_t avg = stat.callCount > 0 ? stat.totalCycles / stat.callCount : 0;
+                        ImGui::Text("%llu", (unsigned long long)avg);
+                        ImGui::TableNextColumn();
+                        ImGui::Text("%u/%u", stat.minCycles, stat.maxCycles);
+                    }
+                    
+                    ImGui::EndTable();
+                }
+                ImGui::EndTabItem();
+            }
+            
+            ImGui::EndTabBar();
         }
         ImGui::EndTabItem();
     }

@@ -6,6 +6,9 @@
 #include "source_map.h"
 #include <string>
 
+// Defined in gte.cpp
+extern void StartStepSource();
+
 const char* source_file_getter(const std::vector<std::string> &items, int index) {
     if (index >= 0 && index < (int)items.size()) {
         return items[index].c_str();
@@ -20,6 +23,10 @@ ImVec2 SteppingWindow::Render() {
     
     if(ImGui::Button("Step")) {
         timekeeper.clock_mode = CLOCKMODE_SINGLE;
+    }
+    ImGui::SameLine();
+    if(ImGui::Button("Step Source")) {
+        StartStepSource();
     }
     ImGui::SameLine();
     if(ImGui::Button("Continue")) {

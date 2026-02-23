@@ -44,6 +44,8 @@
 #include "devtools/stepping_window.h"
 #include "devtools/patching_window.h"
 #include "devtools/controller_options_window.h"
+#include "devtools/callstack_window.h"
+#include "devtools/registers_window.h"
 #include "imgui.h"
 #include "implot.h"
 #include "imgui/backends/imgui_impl_sdl2.h"
@@ -69,7 +71,7 @@ JoystickAdapter *joysticks;
 SystemState system_state;
 CartridgeState cartridge_state;
 
-const int SCREEN_WIDTH = 683;	
+const int SCREEN_WIDTH = 512;
 const int SCREEN_HEIGHT = 512;
 RGB_Color *palette;
 
@@ -193,6 +195,11 @@ extern unsigned char font_map[];
 
 Timekeeper timekeeper;
 Profiler profiler(timekeeper);
+
+// Step Source tracking
+bool stepSourceActive = false;
+std::string stepSourceStartFile;
+int stepSourceStartLine = -1;
 
 SDL_Surface* gRAM_Surface = NULL;
 SDL_Surface* vRAM_Surface = NULL;
@@ -358,6 +365,24 @@ uint8_t MemoryRead(uint16_t address) {
 	return MemoryReadResolve(address, true);
 }
 
+void StartStepSource() {
+	if(SourceMap::singleton) {
+		SourceMapSearchResult res = SourceMap::singleton->Search(cpu_core->pc, cartridge_state.bank_mask);
+		if(res.found) {
+			stepSourceActive = true;
+			stepSourceStartFile = res.file->name;
+			stepSourceStartLine = res.line->line;
+			timekeeper.clock_mode = CLOCKMODE_STEPSOURCE;
+		} else {
+			// No source info, fall back to single step
+			timekeeper.clock_mode = CLOCKMODE_SINGLE;
+		}
+	} else {
+		// No source map, fall back to single step
+		timekeeper.clock_mode = CLOCKMODE_SINGLE;
+	}
+}
+
 uint8_t MemorySync(uint16_t address) {
 	if(timekeeper.clock_mode == CLOCKMODE_NORMAL) {
 		if(Breakpoints::checkBreakpoint(address, cartridge_state.bank_mask)) {
@@ -365,6 +390,23 @@ uint8_t MemorySync(uint16_t address) {
 			Disassembler::Decode(MemoryReadResolve, loadedMemoryMap, address, 32);
 			cpu_core->Freeze();
 		}
+	}
+	// Check for source line change during step source
+	if(stepSourceActive && timekeeper.clock_mode == CLOCKMODE_STEPSOURCE) {
+		if(SourceMap::singleton) {
+			SourceMapSearchResult res = SourceMap::singleton->Search(address, cartridge_state.bank_mask);
+			if(res.found) {
+				// Stop if we're on a different source line in the SAME file (skip runtime functions)
+				if(res.file->name == stepSourceStartFile && res.line->line != stepSourceStartLine) {
+					stepSourceActive = false;
+					timekeeper.clock_mode = CLOCKMODE_STOPPED;
+					Disassembler::Decode(MemoryReadResolve, loadedMemoryMap, address, 32);
+				}
+			}
+		}
+	}
+	// Log JSR/RTS for callstack tracking in all modes (normal, single-step, and step-source)
+	if(timekeeper.clock_mode == CLOCKMODE_NORMAL || timekeeper.clock_mode == CLOCKMODE_SINGLE || timekeeper.clock_mode == CLOCKMODE_STEPSOURCE) {
 		uint8_t opcode = MemoryReadResolve(address, false);
 		if(opcode == 0x20) { //JSR
 			uint16_t jsr_dest = MemoryReadResolve(address+1, false) | (MemoryReadResolve(address+2, false) << 8);
@@ -488,6 +530,15 @@ void MemoryWrite(uint16_t address, uint8_t value) {
 						profiler.ResetTimers();
 						profiler.last_blitter_activity = blitter->pixels_this_frame;
 						blitter->pixels_this_frame = 0;
+					}
+					// Deep profiling based on buffer flips for complete frame capture
+					if(vsyncProfileArmed) {
+						profiler.DeepProfileStart();
+						vsyncProfileArmed = false;
+						vsyncProfileRunning = true;
+					} else if(vsyncProfileRunning) {
+						profiler.DeepProfileStop(loadedMemoryMap, SourceMap::singleton);
+						vsyncProfileRunning = false;
 					}
 				}
 				system_state.dma_control = value;
@@ -796,6 +847,24 @@ void toggleControllerOptionsWindow() {
 	}
 }
 
+void toggleCallstackWindow() {
+	if(!toolTypeIsOpen<CallstackWindow>()) {
+		CallstackWindow* win = new CallstackWindow(profiler, loadedMemoryMap, cpu_core);
+		toolWindows.push_back(win);
+	} else {
+		closeToolByType<CallstackWindow>();
+	}
+}
+
+void toggleRegistersWindow() {
+	if(!toolTypeIsOpen<RegistersWindow>()) {
+		RegistersWindow* win = new RegistersWindow(system_state, cartridge_state, *blitter, profiler);
+		toolWindows.push_back(win);
+	} else {
+		closeToolByType<RegistersWindow>();
+	}
+}
+
 #endif
 
 void toggleFullScreen() {
@@ -923,6 +992,12 @@ void refreshScreen() {
 				if(ImGui::MenuItem("Profiler (F12)")) {
 					toggleProfilerWindow();
 				}
+				if(ImGui::MenuItem("Call Stack (F11)")) {
+					toggleCallstackWindow();
+				}
+				if(ImGui::MenuItem("System Registers")) {
+					toggleRegistersWindow();
+				}
 				if(ImGui::MenuItem("Memory Browser (F9)")) {
 					toggleMemBrowserWindow();
 				}
@@ -941,7 +1016,7 @@ void refreshScreen() {
 				if(ImGui::MenuItem("Dump RAM to file (F6)")) {
 					doRamDump();
 				}
-				if(ImGui::MenuItem("Deep Profile Single Vsync")) {
+				if(ImGui::MenuItem("Deep Profile Single Frame")) {
 					vsyncProfileArmed = true;
 				}
 				ImGui::EndMenu();
@@ -1053,7 +1128,10 @@ EM_BOOL mainloop(double time, void* userdata) {
 					cpu_core->freeze = false;
 					Disassembler::Decode(MemoryReadResolve, loadedMemoryMap, cpu_core->pc, 32);
 					intended_cycles = 1;
-					timekeeper.clock_mode = CLOCKMODE_STOPPED;
+					break;
+				case CLOCKMODE_STEPSOURCE:
+					cpu_core->freeze = false;
+					intended_cycles = 1;
 					break;
 				case CLOCKMODE_STOPPED:
 					intended_cycles = 0;
@@ -1061,6 +1139,11 @@ EM_BOOL mainloop(double time, void* userdata) {
 			}
 			if(intended_cycles) {
 				cpu_core->Run(intended_cycles, timekeeper.totalCyclesCount);
+				// Switch to stopped mode after running single instruction
+				if(timekeeper.clock_mode == CLOCKMODE_SINGLE) {
+					timekeeper.clock_mode = CLOCKMODE_STOPPED;
+				}
+				// CLOCKMODE_STEPSOURCE continues until source line changes (handled in MemorySync)
 			}
 #else
 			intended_cycles = timekeeper.cycles_per_vsync;
@@ -1134,14 +1217,6 @@ EM_BOOL mainloop(double time, void* userdata) {
 				timekeeper.cycles_since_vsync -= timekeeper.cycles_per_vsync;
 				if(system_state.dma_control & DMA_VSYNC_NMI_BIT) {
 					cpu_core->NMI();
-					if(vsyncProfileArmed) {
-						profiler.DeepProfileStart();
-						vsyncProfileArmed = false;
-						vsyncProfileRunning = true;
-					} else if(vsyncProfileRunning) {
-						profiler.DeepProfileStop(loadedMemoryMap, SourceMap::singleton);
-						vsyncProfileRunning = false;
-					}
 				}
 				if(!profiler.measure_by_frameflip) {
 					profiler.ResetTimers();

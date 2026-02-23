@@ -9,6 +9,7 @@ enum ClockMode {
     CLOCKMODE_SINGLE,
     CLOCKMODE_STOPPED,
     CLOCKMODE_STEPOUT,
+    CLOCKMODE_STEPSOURCE,
 };
 
 class Timekeeper {

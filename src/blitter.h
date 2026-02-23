@@ -60,5 +60,7 @@ public:
     Blitter(mos6502*& cpu_core, Timekeeper* timekeeper, SystemState* system_state, SDL_Surface*& vram_surface) : cpu_core(cpu_core), timekeeper(timekeeper), system_state(system_state), vram_surface(vram_surface) {};
 
     void SetParam(uint8_t address, uint8_t value);
+    uint8_t GetParam(uint8_t index) const { return params[index % DMA_PARAMS_COUNT]; }
+    bool IsRunning() const { return running; }
     void CatchUp(uint64_t cycles=0);
 };

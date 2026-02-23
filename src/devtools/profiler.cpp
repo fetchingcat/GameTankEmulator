@@ -27,13 +27,31 @@ void Profiler::ResetTimers() {
 }
 
 void Profiler::LogJSR(uint16_t address, uint8_t bank, uint16_t destination) {
-    if(deepProfileIsRecording) {
+    if(deepProfileIsRecording || callstack_tracking_enabled) {
         timeline.emplace_back(ProfileEventType::CALL, address, destination, bank, timekeeper.totalCyclesCount);
+        // Trim timeline if it gets too large during real-time tracking (not deep profiling)
+        if(!deepProfileIsRecording && timeline.size() > CALLSTACK_MAX_DEPTH * 2) {
+            // Smart trim: preserve open calls that form the current callstack
+            // Extract only the unmatched CALLs (the active callstack)
+            std::vector<ProfileEvent> openCalls;
+            
+            for(const auto& event : timeline) {
+                if(event.type == ProfileEventType::CALL) {
+                    openCalls.push_back(event);
+                } else if(event.type == ProfileEventType::RETURN) {
+                    if(!openCalls.empty()) {
+                        openCalls.pop_back();
+                    }
+                }
+            }
+            
+            timeline = std::move(openCalls);
+        }
     }
 }
 
 void Profiler::LogRTS(uint16_t address, uint8_t bank) {
-    if(deepProfileIsRecording) {
+    if(deepProfileIsRecording || callstack_tracking_enabled) {
         timeline.emplace_back(ProfileEventType::RETURN, address, 0, bank, timekeeper.totalCyclesCount);
     }
 }
@@ -45,7 +63,7 @@ void Profiler::DeepProfileStart() {
     deepProfileZoomFocus = nullptr;
     timeline.clear();
     for(auto& ptr : cleanupList) {
-        free(ptr);
+        delete ptr;
     }
     cleanupList.clear();
 }
